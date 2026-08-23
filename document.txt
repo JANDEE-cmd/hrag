@@ -1,0 +1,276 @@
+# คู่มือการใช้งาน Hybrid RAG CLI (hrag)
+
+เครื่องมือบรรทัดคำสั่ง (CLI) สำหรับสร้างระบบ RAG (Retrieval-Augmented Generation) แบบ Hybrid ที่รองรับทั้งโหมด **offline** (รันโมเดลในเครื่อง) และ **online** (เรียกผ่าน API เช่น Gemini)
+
+---
+
+## 1. ภาพรวมคำสั่งทั้งหมด
+
+| คำสั่ง | หน้าที่ |
+|---|---|
+| `hrag init` | สร้างไฟล์ config.yaml เริ่มต้น |
+| `hrag validate` | ตรวจสอบความถูกต้องของ config.yaml |
+| `hrag diagnostics` | ตรวจสอบ hardware และ environment variables |
+| `hrag ingest` | ประมวลผลเอกสารและสร้าง vector index |
+| `hrag ask` | ถามคำถามครั้งเดียว (single query) |
+| `hrag chat` | เปิดเซสชันแชทแบบโต้ตอบ (interactive) |
+
+**Flag ระดับ global** (ใช้ได้กับทุกคำสั่ง วางไว้ก่อนชื่อคำสั่ง):
+
+```bash
+hrag --verbose <command>     # -v  แสดง log แบบละเอียด (debug)
+hrag --quiet <command>       # -q  แสดงเฉพาะข้อความจำเป็น
+hrag --no-color <command>    #     ปิดสีในผลลัพธ์
+hrag --version                # -V  แสดงเวอร์ชันของ CLI
+```
+
+---
+
+## 2. เริ่มต้นใช้งาน: `hrag init`
+
+สร้างไฟล์ `config.yaml` เริ่มต้น
+
+```bash
+hrag init
+```
+
+**ตัวเลือก:**
+
+| Flag | ค่าเริ่มต้น | คำอธิบาย |
+|---|---|---|
+| `--template`, `-t` | `offline` | เลือก mode เริ่มต้น: `offline` หรือ `online` |
+| `--output`, `-o` | `config.yaml` | ระบุ path ไฟล์ config ที่จะสร้าง |
+| `--force`, `-f` | — | เขียนทับไฟล์เดิมถ้ามีอยู่แล้ว |
+
+**ตัวอย่าง:**
+
+```bash
+hrag init --template online --output config.yaml
+hrag init --force   # เขียนทับไฟล์เดิม
+```
+
+ไฟล์ที่ได้จะมีโครงสร้างประมาณนี้:
+
+```yaml
+project_name: research_rag_project
+mode: online          # หรือ offline
+offline:
+  vector_db: faiss
+  llm_model: ollama/llama3
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  api_key_env_var: null
+online:
+  vector_db: pinecone
+  llm_model: gemini-1.5-flash
+  embedding_model: text-embedding-004     # ⚠️ ควรอัปเดตเป็น gemini-embedding-001
+  api_key_env_var: GEMINI_API_KEY
+data:
+  docs_path: ./data
+  chunk_size: 1000
+  chunk_overlap: 200
+```
+
+> **หมายเหตุสำคัญ:** โมเดล `text-embedding-004` ถูก Google ยกเลิกการรองรับแล้ว ควรแก้เป็น `gemini-embedding-001` ก่อนใช้งานโหมด online (ดูหัวข้อ 8)
+
+---
+
+## 3. ตรวจสอบ config: `hrag validate`
+
+ตรวจสอบว่าไฟล์ config.yaml ถูกต้องตาม schema หรือไม่ ก่อนนำไปใช้จริง
+
+```bash
+hrag validate
+hrag validate --config myconfig.yaml
+hrag validate --strict                      # เข้มงวด: warning ถือเป็น error
+hrag validate --output-format json          # ผลลัพธ์แบบ JSON
+```
+
+ผลลัพธ์ที่เป็นไปได้:
+- **PASS** — config ถูกต้อง
+- **FAIL** — พบ schema error พร้อมรายละเอียดที่ผิด (exit code 1)
+
+---
+
+## 4. ตรวจสอบระบบ: `hrag diagnostics`
+
+ตรวจสอบ hardware (CPU/GPU), เวอร์ชัน Python, และ environment variable ที่จำเป็น (เช่น API key)
+
+```bash
+hrag diagnostics
+hrag diagnostics --output-format json
+```
+
+ผลลัพธ์จะแจ้งเตือนหาก environment variable ที่จำเป็น (เช่น `GEMINI_API_KEY`) ยังไม่ได้ตั้งค่า
+
+---
+
+## 5. สร้าง Vector Index: `hrag ingest`
+
+ประมวลผลเอกสารในโฟลเดอร์ `docs_path` → ตัดเป็น chunk → แปลงเป็น embedding → บันทึกลง vector index
+
+```bash
+hrag ingest
+```
+
+**ตัวเลือกทั้งหมด:**
+
+| Flag | คำอธิบาย |
+|---|---|
+| `--config`, `-c` | ระบุ path ไฟล์ config (default: `config.yaml`) |
+| `--mode` | บังคับ mode สำหรับรอบนี้ (`offline`/`online`) โดยไม่แก้ไฟล์ config |
+| `--force`, `--rebuild` | **บังคับสร้าง index ใหม่ทับของเดิม** (จำเป็นถ้ามี index อยู่แล้ว) |
+| `--dry-run` | สแกนและตัด chunk ดูเฉยๆ ไม่เขียน index จริง |
+| `--workers`, `-w` | จำนวน worker ที่ประมวลผลพร้อมกัน (default: 1) |
+| `--chunk-size` | override ขนาด chunk จาก config |
+| `--chunk-overlap` | override ค่า overlap ระหว่าง chunk |
+| `--include` | ระบุ glob pattern ไฟล์ที่จะรวม (ใส่ซ้ำได้หลายครั้ง) |
+| `--exclude` | ระบุ glob pattern ไฟล์ที่จะไม่รวม (ใส่ซ้ำได้หลายครั้ง) |
+
+**ตัวอย่างการใช้งาน:**
+
+```bash
+# ดูก่อนว่าจะประมวลผลอะไรบ้าง โดยไม่สร้าง index จริง
+hrag ingest --dry-run
+
+# สร้าง index ครั้งแรก
+hrag ingest
+
+# สร้าง index ใหม่ทับของเดิม (จำเป็นเมื่อเปลี่ยน embedding model)
+hrag ingest --force
+
+# กำหนด chunk size เอง และรวมเฉพาะไฟล์ .md
+hrag ingest --force --chunk-size 500 --chunk-overlap 100 --include "*.md"
+```
+
+> ⚠️ **สำคัญ:** ระบบจะ**ปฏิเสธ**การ ingest ถ้าพบ index เดิมอยู่แล้ว (ไม่ว่าจะ mode เดิมหรือเปลี่ยน mode ใหม่) เว้นแต่ใส่ `--force` เพราะ index ที่สร้างจาก embedding model หนึ่ง (เช่น 384 หรือ 3072 dimensions) จะ**ใช้ข้ามกันกับโมเดลอื่นไม่ได้** — ต้อง rebuild ใหม่ทุกครั้งที่เปลี่ยน embedding model
+
+---
+
+## 6. ถามคำถามครั้งเดียว: `hrag ask`
+
+```bash
+hrag ask "สรุปเนื้อหาบทที่ 3 ให้หน่อย"
+```
+
+**ตัวเลือก:**
+
+| Flag | คำอธิบาย |
+|---|---|
+| `--top-k`, `-k` | จำนวน chunk ที่ดึงมาใช้เป็น context (default: 4) |
+| `--mode` | override mode สำหรับคำถามนี้ |
+| `--model`, `-m` | override LLM model สำหรับคำถามนี้ |
+| `--system-prompt` | override system prompt |
+| `--no-context` | ข้ามขั้นตอน retrieval ถามโมเดลตรงๆ โดยไม่ใช้เอกสาร |
+| `--output-format`, `-o` | รูปแบบผลลัพธ์: `text` / `json` / `markdown` |
+| `--save` | บันทึกคำตอบลงไฟล์ |
+
+**ตัวอย่าง:**
+
+```bash
+hrag ask "อธิบายแนวคิดหลักของเอกสาร" --top-k 6
+hrag ask "แปลข้อความนี้เป็นอังกฤษ" --no-context --model gemini-3.5-flash
+hrag ask "สรุปให้เป็นตาราง" --output-format markdown --save output.md
+```
+
+---
+
+## 7. เปิดเซสชันแชท: `hrag chat`
+
+เปิดโหมดสนทนาต่อเนื่อง (multi-turn) แบบโต้ตอบ
+
+```bash
+hrag chat
+```
+
+**ตัวเลือก:**
+
+| Flag | คำอธิบาย |
+|---|---|
+| `--top-k`, `-k` | จำนวน chunk ที่ดึงต่อ 1 turn (default: 2) |
+| `--mode` | override mode |
+| `--model`, `-m` | override LLM model สำหรับเซสชันนี้ |
+| `--system-prompt` | override system prompt |
+| `--max-turns` | จบเซสชันอัตโนมัติหลังครบ N turn |
+| `--resume`, `--session` | ระบุไฟล์บันทึก/โหลดประวัติการสนทนา |
+| `--no-stream` | ปิดการแสดงผลแบบ streaming |
+
+**ตัวอย่าง:**
+
+```bash
+hrag chat --top-k 3
+hrag chat --session mysession.json      # บันทึก/โหลดประวัติแชท
+hrag chat --max-turns 10 --model gemini-3.5-flash
+```
+
+ระหว่างแชท พิมพ์ `exit`, `quit` หรือ `q` เพื่อออกจากเซสชัน หรือกด `Ctrl+C` / `Ctrl+D`
+
+---
+
+## 8. การแก้ปัญหาที่พบบ่อย
+
+### ❌ `404 Not Found` ตอนเรียก embed_content (โหมด online)
+
+**สาเหตุ:** `embedding_model` ใน config ผิด หรือใช้โมเดลที่ Google เลิกรองรับแล้ว (เช่น `sentence-transformers/...` หรือ `text-embedding-004` ที่ deprecated)
+
+**วิธีแก้:** แก้ `online.embedding_model` ใน `config.yaml` เป็น:
+
+```yaml
+online:
+  embedding_model: gemini-embedding-001
+```
+
+แล้ว rebuild index ใหม่ (จำเป็น เพราะ dimension เปลี่ยนจาก 768 → 3072):
+
+```bash
+hrag ingest --force
+```
+
+### ❌ Error ตอนเปลี่ยน mode แล้ว ingest ไม่ได้
+
+**สาเหตุ:** มี index เก่าอยู่ และ CLI ป้องกันไม่ให้ทับโดยไม่ตั้งใจ
+
+**วิธีแก้:** เพิ่ม `--force` ท้ายคำสั่ง `hrag ingest`
+
+### ⚠️ `Missing required environment variables` จาก `hrag diagnostics`
+
+**สาเหตุ:** ยังไม่ได้ตั้งค่า API key (เช่น `GEMINI_API_KEY`) ตามที่ config ระบุไว้ใน `api_key_env_var`
+
+**วิธีแก้ (Windows PowerShell):**
+
+```powershell
+$env:GEMINI_API_KEY = "your-api-key-here"
+```
+
+**วิธีแก้ (macOS/Linux):**
+
+```bash
+export GEMINI_API_KEY="your-api-key-here"
+```
+
+---
+
+## 9. Workflow แนะนำสำหรับผู้เริ่มต้น
+
+```bash
+# 1) สร้าง config เริ่มต้น
+hrag init --template online
+
+# 2) แก้ config.yaml ให้ตรงกับที่ต้องการ (embedding_model, docs_path, api key env var)
+
+# 3) ตรวจสอบว่า config ถูกต้อง
+hrag validate
+
+# 4) ตรวจสอบว่า environment/API key พร้อมใช้งาน
+hrag diagnostics
+
+# 5) ทดสอบดูก่อนว่าจะ ingest อะไรบ้าง
+hrag ingest --dry-run
+
+# 6) สร้าง vector index จริง
+hrag ingest
+
+# 7) เริ่มถามคำถาม
+hrag ask "คำถามของฉันคืออะไร"
+# หรือเปิดแชทแบบต่อเนื่อง
+hrag chat
+```

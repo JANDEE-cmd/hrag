@@ -1,0 +1,16 @@
+project_name: research_rag_project
+mode: online
+offline:
+  vector_db: faiss
+  llm_model: ollama/llama3.2:1b
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  api_key_env_var: null
+online:
+  vector_db: faiss
+  llm_model: gemini/gemini-3.5-flash
+  embedding_model: gemini/gemini-embedding-001
+  api_key_env_var: GEMINI_API_KEY
+data:
+  docs_path: ./data
+  chunk_size: 1000
+  chunk_overlap: 200

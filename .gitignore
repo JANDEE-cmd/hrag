@@ -1,0 +1,11 @@
+.env
+
+vector_index.bin
+vector_metadata.json
+
+__pycache__/
+*.pyc
+
+venv/
+env/
+.venv/

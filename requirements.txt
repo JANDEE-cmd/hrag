@@ -1,0 +1,25 @@
+# --- CLI ---
+typer>=0.12
+rich>=13.7
+prompt-toolkit>=3.0
+
+# --- Config / validation ---
+pydantic>=2.6
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# --- Data / chunking ---
+langchain-text-splitters>=0.2
+requests>=2.31
+
+# --- Vector store / embeddings ---
+faiss-cpu>=1.8
+numpy>=1.26
+sentence-transformers>=3.0
+
+# --- LLM / embedding routing ---
+litellm>=1.98.0
+
+# --- Optional: only used for hardware detection in env_diagnostics.py
+# (falls back to "CPU" gracefully if not installed) ---
+# torch
