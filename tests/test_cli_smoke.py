@@ -1,9 +1,9 @@
 """
-Smoke tests for the `hrag` CLI.
+Comprehensive smoke tests for the `hrag` CLI.
 
 These don't call any real LLM/embedding provider or load heavy models --
-they only check that the CLI's config-handling commands (init, validate,
-diagnostics, --version) work end-to-end without crashing. Run with:
+they check that all core CLI commands (init, validate, diagnostics, version, 
+clear-index, --version) work end-to-end without crashing. Run with:
 
     pip install -e ".[test]"
     pytest
@@ -29,10 +29,15 @@ def isolated_cwd(tmp_path, monkeypatch):
     yield tmp_path
 
 
-def test_version():
+def test_version_flag():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "version" in result.stdout.lower()
+
+
+def test_version_command():
+    result = runner.invoke(app, ["version"])
+    assert result.exit_code == 0
 
 
 def test_init_creates_config(isolated_cwd):
@@ -114,5 +119,22 @@ def test_diagnostics_flags_missing_online_api_key(isolated_cwd, monkeypatch):
     runner.invoke(app, ["init", "--template", "online", "--force"])
 
     result = runner.invoke(app, ["diagnostics", "--output-format", "json"])
+    assert result.exit_code == 0
+    
     report = json.loads(result.stdout)
     assert "GEMINI_API_KEY" in report["missing_api_keys"]
+
+
+def test_clear_index_removes_files(isolated_cwd):
+    # Simulate existing index and metadata files
+    (isolated_cwd / "vector_index.bin").write_text("fake index data")
+    (isolated_cwd / "vector_metadata.json").write_text("[]")
+
+    assert (isolated_cwd / "vector_index.bin").exists()
+    assert (isolated_cwd / "vector_metadata.json").exists()
+
+    result = runner.invoke(app, ["clear-index"])
+    assert result.exit_code == 0
+
+    assert not (isolated_cwd / "vector_index.bin").exists()
+    assert not (isolated_cwd / "vector_metadata.json").exists()

@@ -322,6 +322,8 @@ def ingest(
     chunk_overlap: Optional[int] = typer.Option(None, "--chunk-overlap", help="Override chunk overlap from config."),
     include: List[str] = typer.Option(None, "--include", help="Glob pattern(s) to include (repeatable)."),
     exclude: List[str] = typer.Option(None, "--exclude", help="Glob pattern(s) to exclude (repeatable)."),
+    # ✅ เพิ่มพารามิเตอร์รับ URL จาก Command Line ตรงนี้
+    url: Optional[List[str]] = typer.Option(None, "--url", "-u", help="URL(s) to ingest dynamically."),
 ):
     """Process documents and build the vector database."""
     raw_data = load_config(config)
@@ -340,16 +342,16 @@ def ingest(
         raw_data["data"]["include"] = include
     if exclude:
         raw_data["data"]["exclude"] = exclude
+        
+    # ✅ ถ้าผู้ใช้พิมพ์ --url มาตอนรันคำสั่ง ให้ยัดใส่ config ชั่วคราวตรงนี้เลย
+    if url:
+        raw_data["data"]["urls"] = url
 
     raw_data = validate_or_exit(raw_data)
 
     active_mode = raw_data['mode']
     embedding_model = raw_data[active_mode].get('embedding_model', 'unknown')
 
-    # An index built under one mode's embedding model is not compatible with
-    # the other mode's embedder (different vector dimensions). Refuse to
-    # silently overwrite an existing index when switching modes unless the
-    # user explicitly confirms with --force.
     index_path = "vector_index.bin"
     metadata_path = "vector_metadata.json"
     existing_index = os.path.exists(index_path) or os.path.exists(metadata_path)
@@ -367,7 +369,7 @@ def ingest(
     log(f"--- Starting Data Ingestion Pipeline (Mode: {active_mode.upper()}, Embedding: {embedding_model}) ---")
 
     processor = DocumentProcessor(raw_data['data'])
-    log(f"Scanning directory: {raw_data['data']['docs_path']}")
+    log(f"Scanning directory / sources...")
 
     chunks = processor.process()
     log(f"Total chunks created: {len(chunks)}")
@@ -604,5 +606,62 @@ def run(
             console.print("\n[bold yellow]Session interrupted. Goodbye.[/bold yellow]")
             break
 
+@app.command()
+def version():
+    """Display the current version of the CLI."""
+    console.print(f"rag-cli version {__version__}")
+
+@app.command()
+def help():
+    """Show help information for the CLI."""
+    console.print("[bold cyan]Hybrid RAG CLI Interface[/bold cyan]")
+    console.print("Use '[bold]hrag COMMAND --help[/bold]' for command-specific help.")
+    console.print("Available commands:")
+    for command in app.registered_commands:
+        console.print(f"  - [bold]{command.name}[/bold]: {command.help}")
+
+@app.command()
+def list_commands():
+    """List all available commands in the CLI."""
+    console.print("[bold cyan]Available Commands:[/bold cyan]")
+    for command in app.registered_commands:
+        console.print(f"  - [bold]{command.name}[/bold]: {command.help}")
+
+@app.command()
+def clear_index(
+    index_path: str = typer.Option("vector_index.bin", "--index-path", "-i", help="Path to the vector index file."),
+    metadata_path: str = typer.Option("vector_metadata.json", "--metadata-path", "-m", help="Path to the vector metadata file."),
+):
+    """Delete the existing vector index and metadata files."""
+    if os.path.exists(index_path):
+        os.remove(index_path)
+        log(f"Deleted vector index file: {index_path}")
+    else:
+        log(f"No vector index file found at: {index_path}", "warn")
+
+    if os.path.exists(metadata_path):
+        os.remove(metadata_path)
+        log(f"Deleted vector metadata file: {metadata_path}")
+    else:
+        log(f"No vector metadata file found at: {metadata_path}", "warn")
+
+@app.command()
+def reset(
+    config: str = CONFIG_OPTION,
+    force: bool = typer.Option(False, "--force", "-f", help="Confirm reset without prompt."),
+):
+    """Reset the RAG system by clearing the index and reinitializing the config."""
+    if not force:
+        confirm = typer.confirm("Are you sure you want to reset the RAG system? This will delete the index and reset the config.")
+        if not confirm:
+            log("Reset aborted by user.", "warn")
+            raise typer.Exit(0)
+
+    clear_index()
+    init(force=True)
+    log("RAG system has been reset.", "info")
+
 if __name__ == "__main__":
     app()
+
+

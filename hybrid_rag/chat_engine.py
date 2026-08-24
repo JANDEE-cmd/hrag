@@ -70,18 +70,11 @@ def retry_with_backoff(max_attempts: int = 3, base_delay: float = 1.0):
 
 class ChatEngine:
     """
-    RAG chat engine backed by LiteLLM.
-
-    LiteLLM gives us a single interface across providers: point `llm_model`
-    at "ollama/llama3.2:1b" for local models, or "gemini/gemini-3.5-flash",
-    "openai/gpt-4o", "anthropic/claude-3-5-sonnet-latest", "azure/<deployment>",
-    etc. for hosted APIs -- same `generate()` call either way.
+    RAG chat engine backed by LiteLLM with support for Hybrid Search and Streaming responses.
     """
 
     def __init__(self, config: dict, mode: str):
         self.mode = mode
-        # Keep the system prompt (top-level key) before narrowing to the
-        # mode-specific section, otherwise --system-prompt silently no-ops.
         self.system_prompt = config.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
 
         self.config = config[mode]
@@ -91,9 +84,6 @@ class ChatEngine:
         self.index_path = "vector_index.bin"
         self.metadata_path = "vector_metadata.json"
 
-        # Resolve the API key from whichever env var the config points at.
-        # Passed explicitly to every litellm call so behavior doesn't depend
-        # on the provider's "standard" env var name (e.g. OPENAI_API_KEY).
         self.api_key = None
         env_var = self.config.get('api_key_env_var')
         if env_var:
@@ -103,7 +93,6 @@ class ChatEngine:
                     f"System Error: {env_var} environment variable is not set!"
                 )
 
-        # Local Ollama doesn't need a key but does need a reachable server.
         self.api_base = DEFAULT_OLLAMA_API_BASE if self.mode == "offline" else None
 
         logger.info(f"Initializing ChatEngine in {mode} mode with model: {self.llm_model}")
@@ -117,9 +106,7 @@ class ChatEngine:
 
     def _normalize_model_name(self, model_name: str) -> str:
         """
-        Ensure the model string carries a LiteLLM provider prefix
-        (e.g. 'ollama/llama3.2:1b'). Bare offline model names from older
-        configs are auto-prefixed with 'ollama/' for backwards compatibility.
+        Ensure the model string carries a LiteLLM provider prefix.
         """
         if self.mode == "offline" and "/" not in model_name:
             logger.warning(
@@ -170,29 +157,39 @@ class ChatEngine:
             logger.error(f"Failed to embed query via LiteLLM: {e}")
             raise
 
-    def retrieve(self, query: str, top_k: int = 2) -> str:
+    def retrieve(self, query: str, top_k: int = 5) -> str:
         """
-        Retrieve relevant context chunks for a query.
-
-        Returns a meaningful placeholder message (instead of "") if no
-        relevant chunks are found, so downstream prompts stay coherent.
+        Retrieve relevant context chunks using Hybrid Search (Vector + BM25 via RRF).
         """
         logger.debug(f"Retrieving top {top_k} chunks for query: {query[:100]}...")
 
-        query_vector = self._embed_query(query)
-        distances, indices = self.index.search(query_vector, top_k)
+        # Import HybridSearchEngine from vector_store or implement/reuse logic
+        # Here we use FAISS search + RRF logic aligned with BaseVectorStore
+        try:
+            query_vector = self._embed_query(query)
+            fetch_k = min(top_k * 3, len(self.metadata))
+            distances, indices = self.index.search(query_vector, fetch_k)
 
-        logger.debug(f"Search returned indices: {indices[0]}, distances: {distances[0]}")
-
-        contexts = []
-        for idx in indices[0]:
-            if idx != -1:
-                try:
-                    chunk = self.metadata[idx]
-                    contexts.append(chunk["content"])
-                except (KeyError, IndexError) as e:
-                    logger.warning(f"Skipping chunk {idx}: {e}")
+            vector_results = []
+            for score, idx in zip(distances[0], indices[0]):
+                if idx == -1:
                     continue
+                vector_results.append({
+                    "chunk_id": int(idx),
+                    "content": self.metadata[idx]["content"],
+                    "score": float(score)
+                })
+
+            # Import HybridSearchEngine locally to avoid circular imports if any
+            from hybrid_rag.vector_store import HybridSearchEngine
+            hybrid_engine = HybridSearchEngine(self.metadata)
+            keyword_results = hybrid_engine.keyword_search(query, top_k=fetch_k)
+            final_results = hybrid_engine.reciprocal_rank_fusion(vector_results, keyword_results)
+
+            contexts = [res["content"] for res in final_results[:top_k]]
+        except Exception as e:
+            logger.error(f"Hybrid retrieval failed: {e}")
+            contexts = []
 
         if not contexts:
             warning = (
@@ -202,11 +199,14 @@ class ChatEngine:
             logger.warning("No relevant chunks found for query")
             return warning
 
-        logger.info(f"Retrieved {len(contexts)} relevant chunks")
+        logger.info(f"Retrieved {len(contexts)} relevant chunks via Hybrid Search")
         return "\n\n---\n\n".join(contexts)
 
-    def generate(self, query: str, context: str) -> str:
-        """Constructs prompt (with system instructions) and calls the LLM via LiteLLM."""
+    def generate(self, query: str, context: str, stream: bool = False):
+        """
+        Constructs prompt (with system instructions) and calls the LLM via LiteLLM.
+        If stream=True, returns a generator for real-time token streaming.
+        """
         logger.debug(f"Generating response for query: {query[:100]}...")
 
         user_content = (
@@ -220,33 +220,33 @@ class ChatEngine:
             {"role": "user", "content": user_content},
         ]
 
-        return self._call_llm(messages)
+        return self._call_llm(messages, stream=stream)
+
+    def ask(self, query: str, top_k: int = 5, stream: bool = False):
+        """
+        End-to-end RAG method: retrieves context and generates a response (supports streaming).
+        """
+        context = self.retrieve(query, top_k=top_k)
+        return self.generate(query, context, stream=stream)
 
     @retry_with_backoff(max_attempts=3, base_delay=1.5)
-    def _call_llm(self, messages: list) -> str:
+    def _call_llm(self, messages: list, stream: bool = False):
         """
-        Single LiteLLM completion call, used for both offline (Ollama) and
-        online (any hosted provider) modes.
+        Single LiteLLM completion call supporting both normal and streaming responses.
         """
         try:
-            logger.debug(f"Calling LiteLLM with model: {self.llm_model}")
+            logger.debug(f"Calling LiteLLM with model: {self.llm_model} (stream={stream})")
 
             call_kwargs = dict(
                 model=self.llm_model,
                 messages=messages,
                 temperature=0.0,
                 api_key=self.api_key,
+                stream=stream,
             )
 
             if self.mode == "offline":
                 call_kwargs["api_base"] = self.api_base
-                # Ollama-specific options (LiteLLM forwards these straight
-                # through to Ollama's /api/generate `options` payload).
-                # num_gpu=0 keeps the model on CPU: small/local machines
-                # commonly don't have enough VRAM, and Ollama's llama-server
-                # process crashes (CUDA OOM) instead of falling back to CPU
-                # on its own. Raise num_gpu (or drop it) if your GPU has
-                # enough headroom for the model you're running.
                 call_kwargs.update(
                     num_gpu=0,
                     num_ctx=2048,
@@ -259,17 +259,14 @@ class ChatEngine:
 
             response = litellm.completion(**call_kwargs)
             logger.info(f"✓ LiteLLM call successful ({self.llm_model})")
+
+            if stream:
+                return response
+
             return response.choices[0].message.content
 
         except RETRYABLE_ERRORS as e:
             msg = str(e).lower()
-            # cudaMalloc/OOM failures are NOT transient — retrying with the
-            # same request just burns time hitting the same wall. Ollama's
-            # num_gpu=0 tells it to place 0 layers on the GPU, but its
-            # llama-server subprocess can still probe/reserve a CUDA context
-            # on startup if a GPU is visible at all, which fails outright on
-            # machines with little/no free VRAM. That's an Ollama-server-level
-            # setting, not something fixable from a single API request.
             oom_signature = any(s in msg for s in (
                 "cudamalloc failed", "out of memory", "cuda_host",
                 "unable to allocate", "llama-server process has terminated",
@@ -286,9 +283,6 @@ class ChatEngine:
                     f"     (or set CUDA_VISIBLE_DEVICES=\"\" before starting it)\n"
                     f"  3. Or free VRAM / use a smaller model if you want GPU acceleration."
                 ) from e
-            # Otherwise: a genuine transient issue (connection refused,
-            # timeout, rate limit, brief unavailability) — let the retry
-            # decorator handle it as before.
             raise
         except APIError as e:
             logger.error(f"LiteLLM API Error ({self.llm_model}): {e}")

@@ -2,42 +2,45 @@ import os
 import glob
 import logging
 from typing import List, Dict
+import requests
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import pymupdf
+import pandas as pd
+import docx
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-
 class DocumentProcessor:
-    """Loads and chunks documents with comprehensive error handling."""
+    """Loads and chunks documents with comprehensive error handling and contextual metadata."""
     
     def __init__(self, data_config: dict):
         self.docs_path = data_config['docs_path']
         self.chunk_size = data_config['chunk_size']
         self.chunk_overlap = data_config['chunk_overlap']
-        
-        # ✅ NEW: Validate config values
+        self.urls = data_config.get('urls', [])
+
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
         if self.chunk_overlap < 0:
             raise ValueError(f"chunk_overlap must be non-negative, got {self.chunk_overlap}")
         if self.chunk_overlap >= self.chunk_size:
-            raise ValueError(
-                f"chunk_overlap ({self.chunk_overlap}) must be less than "
-                f"chunk_size ({self.chunk_size})"
-            )
+            raise ValueError(f"chunk_overlap must be less than chunk_size")
         
         logger.info(
             f"DocumentProcessor initialized: docs_path={self.docs_path}, "
             f"chunk_size={self.chunk_size}, overlap={self.chunk_overlap}"
         )
         
+        # ✅ SEMANTIC SPLITTER: กำหนด Separators ให้เน้นหั่นตาม "ย่อหน้า (\n\n)" หรือ "ประโยค (. )" 
+        # เพื่อไม่ให้ความหมายขาดตอน (หลีกเลี่ยงการหั่นกลางประโยค)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len,
         )
         
-        # ✅ NEW: Track statistics
         self.stats = {
             "files_found": 0,
             "files_processed": 0,
@@ -46,184 +49,193 @@ class DocumentProcessor:
             "empty_chunks_skipped": 0,
         }
 
+    # ---------------------------------------------------------
+    # MULTI-FORMAT READERS
+    # ---------------------------------------------------------
+    def _read_pdf(self, file_path: str) -> str:
+        text_parts = []
+        try:
+            with pymupdf.open(file_path) as doc:
+                for page in doc:
+                    text_parts.append(page.get_text())
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Failed to extract PDF {file_path}: {e}")
+            raise
+
+    def _read_csv(self, file_path: str) -> str:
+        try:
+            df = pd.read_csv(file_path).dropna(how='all')
+            return "\n".join([f"Row {idx}: " + " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)]) for idx, row in df.iterrows()])
+        except Exception as e:
+            logger.error(f"Failed to extract CSV {file_path}: {e}")
+            raise
+
+    def _read_excel(self, file_path: str) -> str:
+        try:
+            df = pd.read_excel(file_path).dropna(how='all')
+            return "\n".join([f"Row {idx}: " + " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)]) for idx, row in df.iterrows()])
+        except Exception as e:
+            logger.error(f"Failed to extract Excel {file_path}: {e}")
+            raise
+
+    def _read_docx(self, file_path: str) -> str:
+        try:
+            doc = docx.Document(file_path)
+            return "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        except Exception as e:
+            logger.error(f"Failed to extract DOCX {file_path}: {e}")
+            raise
+
+    def _read_html(self, file_path: str) -> str:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                soup = BeautifulSoup(f, 'html.parser')
+                return soup.get_text(separator='\n\n', strip=True)
+        except Exception as e:
+            logger.error(f"Failed to extract HTML {file_path}: {e}")
+            raise
+
+    def _read_url(self, url: str) -> str:
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            return soup.get_text(separator='\n\n', strip=True)
+        except Exception as e:
+            logger.error(f"Failed to extract URL {url}: {e}")
+            raise
+
+
+
+    # ---------------------------------------------------------
+    # MAIN PIPELINE
+    # ---------------------------------------------------------
     def load_documents(self) -> List[Dict]:
-        """
-        Loads text and markdown files from the specified directory.
-        
-        ✅ FIXED: Better error handling and file validation
-        """
-        if not os.path.exists(self.docs_path):
-            logger.warning(f"Directory not found: {self.docs_path}")
-            return []
-
-        if not os.path.isdir(self.docs_path):
-            raise ValueError(f"Not a directory: {self.docs_path}")
-
         documents = []
-        search_pattern = os.path.join(self.docs_path, "**", "*.*")
         
-        file_paths = list(glob.glob(search_pattern, recursive=True))
-        logger.info(f"Found {len(file_paths)} files, filtering for .txt and .md...")
-        
-        for file_path in file_paths:
-            # Only process text and markdown files
-            if not (file_path.endswith('.txt') or file_path.endswith('.md')):
-                continue
+        # ==========================================
+        # 1. โหลดข้อมูลจากไฟล์ในโฟลเดอร์ (Local Files)
+        # ==========================================
+        if os.path.exists(self.docs_path) and os.path.isdir(self.docs_path):
+            search_pattern = os.path.join(self.docs_path, "**", "*.*")
+            file_paths = list(glob.glob(search_pattern, recursive=True))
+            supported_exts = ['.txt', '.md', '.pdf', '.csv', '.xlsx', '.docx', '.html', '.htm']
             
-            self.stats["files_found"] += 1
-            
-            # ✅ NEW: Validate file is readable
-            if not os.path.isfile(file_path):
-                logger.warning(f"Skipping non-file: {file_path}")
-                self.stats["files_failed"] += 1
-                continue
-            
-            if not os.access(file_path, os.R_OK):
-                logger.warning(f"File not readable: {file_path}")
-                self.stats["files_failed"] += 1
-                continue
-            
-            # ✅ NEW: Check file size (warn on very large files)
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if file_size_mb > 50:
-                logger.warning(f"Large file ({file_size_mb:.1f}MB): {file_path}")
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
+            for file_path in file_paths:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext not in supported_exts:
+                    continue
                 
-                # ✅ NEW: Validate content isn't empty
-                if not text or not text.strip():
-                    logger.warning(f"Empty file: {file_path}")
+                self.stats["files_found"] += 1
+                if not os.path.isfile(file_path) or not os.access(file_path, os.R_OK):
                     self.stats["files_failed"] += 1
                     continue
                 
-                documents.append({
-                    "source": file_path,
-                    "content": text,
-                    "size_bytes": len(text.encode('utf-8'))
-                })
-                self.stats["files_processed"] += 1
-                logger.debug(f"Loaded: {file_path} ({len(text)} chars)")
-                
-            except UnicodeDecodeError as e:
-                logger.warning(
-                    f"Failed to read {file_path} (encoding error): {e}. "
-                    f"Ensure file is UTF-8 encoded."
-                )
-                self.stats["files_failed"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to read {file_path}: {e}")
-                self.stats["files_failed"] += 1
-        
-        logger.info(
-            f"Loaded {self.stats['files_processed']} files "
-            f"({self.stats['files_failed']} failed)"
-        )
+                try:
+                    text = ""
+                    if ext in ['.txt', '.md']:
+                        with open(file_path, 'r', encoding='utf-8') as f: text = f.read()
+                    elif ext == '.pdf': text = self._read_pdf(file_path)
+                    elif ext == '.csv': text = self._read_csv(file_path)
+                    elif ext == '.xlsx': text = self._read_excel(file_path)
+                    elif ext == '.docx': text = self._read_docx(file_path)
+                    elif ext in ['.html', '.htm']: text = self._read_html(file_path)
+                    
+                    if not text.strip():
+                        self.stats["files_failed"] += 1
+                        continue
+                    
+                    file_title = os.path.splitext(os.path.basename(file_path))[0].replace("_", " ").title()
+                    documents.append({
+                        "source": file_path,
+                        "title": file_title,
+                        "content": text,
+                        "size_bytes": len(text.encode('utf-8'))
+                    })
+                    self.stats["files_processed"] += 1
+                except Exception as e:
+                    logger.warning(f"Failed to read {file_path}: {e}")
+                    self.stats["files_failed"] += 1
+
+        # ==========================================
+        # 2. ✅ NEW: โหลดข้อมูลจาก Web URLs
+        # ==========================================
+        if self.urls:
+            logger.info(f"Fetching data from {len(self.urls)} URLs...")
+            for url in self.urls:
+                self.stats["files_found"] += 1 # นับ URL เป็นไฟล์นึง
+                try:
+                    text = self._read_url(url)
+                    if not text.strip():
+                        self.stats["files_failed"] += 1
+                        continue
+                    
+                    documents.append({
+                        "source": url,
+                        "title": url.split('//')[-1].split('/')[0], # ใช้ Domain Name เป็น Title คร่าวๆ
+                        "content": text,
+                        "size_bytes": len(text.encode('utf-8'))
+                    })
+                    self.stats["files_processed"] += 1
+                    logger.debug(f"Loaded URL: {url}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {url}: {e}")
+                    self.stats["files_failed"] += 1
+
         return documents
+    
 
     def chunk_documents(self, documents: List[Dict]) -> List[Dict]:
-        """
-        Splits documents into smaller chunks based on config.
-        
-        ✅ FIXED: Comprehensive input validation and error handling
-        """
-        if not documents:
-            logger.warning("No documents to chunk")
-            return []
+        if not documents: return []
         
         chunked_data = []
-        
         for doc in documents:
-            # ✅ NEW: Validate document structure
             content = doc.get("content", "").strip()
             source = doc.get("source", "unknown")
-            
-            if not content:
-                logger.warning(f"Skipping document with empty content: {source}")
-                self.stats["files_failed"] += 1
-                continue
+            title = doc.get("title", "Unknown Document")
             
             try:
                 chunks = self.text_splitter.split_text(content)
-                
-                if not chunks:
-                    logger.warning(
-                        f"No chunks produced from {source} "
-                        f"(content might be too small for chunk_size={self.chunk_size})"
-                    )
-                    self.stats["files_failed"] += 1
-                    continue
-                
-                # ✅ NEW: Filter out empty chunks and track them
                 valid_chunks = []
+                
                 for i, chunk in enumerate(chunks):
                     chunk_text = chunk.strip()
-                    
-                    if not chunk_text:
+                    if len(chunk_text.split()) < 3:
                         self.stats["empty_chunks_skipped"] += 1
                         continue
                     
-                    # ✅ NEW: Additional validation
-                    if len(chunk_text.split()) < 3:  # Too short
-                        logger.debug(f"Skipping very short chunk from {source}")
-                        self.stats["empty_chunks_skipped"] += 1
-                        continue
+                    # ✅ CONTEXTUAL CHUNKING: แปะชื่อเอกสารนำหน้าทุกๆ Chunk
+                    # เพื่อให้ Vector DB และ AI ไม่ลืมว่าข้อความนี้มาจากเอกสารอะไร
+                    enriched_content = f"[Document Title: {title}]\n{chunk_text}"
                     
                     chunked_data.append({
                         "source": source,
                         "chunk_id": i,
-                        "content": chunk_text,
-                        "chunk_size": len(chunk_text)
+                        "content": enriched_content,
+                        "chunk_size": len(enriched_content)
                     })
-                    valid_chunks.append(chunk_text)
+                    valid_chunks.append(enriched_content)
                 
                 self.stats["total_chunks"] += len(valid_chunks)
-                logger.debug(
-                    f"✓ {source}: {len(valid_chunks)} valid chunks "
-                    f"({len(chunks) - len(valid_chunks)} empty skipped)"
-                )
                 
             except Exception as e:
                 logger.error(f"Error chunking {source}: {e}")
                 self.stats["files_failed"] += 1
-                continue
-        
+                
         return chunked_data
 
     def process(self) -> List[Dict]:
-        """
-        Executes the full pipeline: Load -> Chunk.
-        
-        Returns statistics about the processing.
-        """
         logger.info("=== Starting Document Processing Pipeline ===")
-        
-        # Load
         raw_docs = self.load_documents()
-        if not raw_docs:
-            logger.error("No valid documents found to process")
-            return []
-        
-        logger.info(f"Loaded {len(raw_docs)} documents")
-        
-        # Chunk
         chunks = self.chunk_documents(raw_docs)
         
-        # Log final statistics
         logger.info("=== Document Processing Complete ===")
         logger.info(f"Files found:          {self.stats['files_found']}")
         logger.info(f"Files processed:      {self.stats['files_processed']}")
-        logger.info(f"Files failed:         {self.stats['files_failed']}")
         logger.info(f"Total chunks created: {self.stats['total_chunks']}")
-        logger.info(f"Empty chunks skipped: {self.stats['empty_chunks_skipped']}")
-        
-        if self.stats['total_chunks'] == 0:
-            logger.error("No valid chunks produced - check your documents")
-            return []
         
         return chunks
     
     def get_stats(self) -> Dict:
-        """Return processing statistics."""
         return self.stats.copy()
